@@ -3,105 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import aiohttp
 
-from src.core.dispatch.candidate import Candidate, make_id
+from src.core.dispatch.cand import Candidate, make_id
 from src.foundation.logger import get_logger
 
-from .constants import BASE_URL, CHAT_PATH, CAPS
-from .headers import build_headers
-from .payloads import build_payload
-from .sse import parse_sse_line
+from .helpers.client_helpers import KeyState as _KeyState, build_chat_request, dispatch_chat_response
+from .consts import CAPS
 
 logger = get_logger(__name__)
 
 MAX_RETRIES: int = 3
-
-
-# 连续失败阈值，超过后进入冷却
-_FAILURE_THRESHOLD: int = 3
-# Key 失效冷却时间（秒）
-_RECOVERY_INTERVAL: float = 60.0
-# 鉴权失败状态码——此类 Key 直接标记为无效
-_AUTH_ERROR_CODES = frozenset({401, 402, 403})
-
-
-class _KeyState:
-    """单个 API Key 的运行时状态。
-
-    不使用锁——依赖 asyncio 单线程事件循环保证操作原子性。
-    """
-
-    __slots__ = ("key", "_valid", "consecutive_failures", "last_error_time")
-
-    def __init__(self, key: str) -> None:
-        """初始化 Key 状态。
-
-        Args:
-            key: API Key 字符串。
-        """
-        self.key: str = key
-        self._valid: bool = True
-        self.consecutive_failures: int = 0
-        self.last_error_time: float = 0.0
-
-    def is_available(self) -> bool:
-        """判断当前 Key 是否可用。
-
-        副作用分离：不在此方法内修改状态，由 try_recover() 负责恢复。
-
-        Returns:
-            True 表示可用，False 表示不可用。
-        """
-        if not self._valid:
-            return False
-        if self.consecutive_failures >= _FAILURE_THRESHOLD:
-            if time.monotonic() - self.last_error_time < _RECOVERY_INTERVAL:
-                return False
-        return True
-
-    def try_recover(self) -> None:
-        """尝试从冷却状态中恢复。
-
-        若冷却时间已过，重置失败计数并恢复可用状态。
-        """
-        if not self._valid:
-            if time.monotonic() - self.last_error_time >= _RECOVERY_INTERVAL:
-                self._valid = True
-                self.consecutive_failures = 0
-                logger.info("chutes Key 已从无效状态恢复: %s...", self.key[:16])
-        elif self.consecutive_failures >= _FAILURE_THRESHOLD:
-            if time.monotonic() - self.last_error_time >= _RECOVERY_INTERVAL:
-                self.consecutive_failures = 0
-                logger.info("chutes Key 冷却结束，恢复可用: %s...", self.key[:16])
-
-    def mark_success(self) -> None:
-        """标记本次请求成功，重置失败计数。
-        """
-        self.consecutive_failures = 0
-
-    def mark_failure(self, status: int = 0) -> None:
-        """标记本次请求失败并更新状态。
-
-        Args:
-            status: HTTP 响应状态码，0 表示网络异常。
-        """
-        self.last_error_time = time.monotonic()
-        if status in _AUTH_ERROR_CODES:
-            self._valid = False
-            logger.warning(
-                "chutes Key 鉴权失败 (HTTP %d)，已标记无效: %s...",
-                status, self.key[:16],
-            )
-        else:
-            self.consecutive_failures += 1
-            logger.warning(
-                "chutes Key 连续失败 %d 次: %s...",
-                self.consecutive_failures, self.key[:16],
-            )
 
 
 class ChutesClient:
@@ -109,6 +23,7 @@ class ChutesClient:
 
     每个 API Key 对应一个候选项，统一由 TAS 算法调度。
     不使用 asyncio.Lock，依赖事件循环单线程特性保证并发安全。
+    Key 状态与请求/响应构造拆分至 ``client_helpers.py``。
     """
 
     def __init__(self) -> None:
@@ -156,8 +71,7 @@ class ChutesClient:
             cand.models = list(models)
 
     def _rebuild_candidates(self) -> None:
-        """根据当前 Key 状态重建候选项列表。
-        """
+        """根据当前 Key 状态重建候选项列表。"""
         self._candidates = [
             Candidate(
                 id=make_id("chutes", ks.key[:16]),
@@ -293,18 +207,9 @@ class ChutesClient:
         if ks is None:
             raise Exception("chutes: 未找到对应 API Key 状态")
 
-        api_key = candidate.meta.get("api_key", "")
-        headers = build_headers(api_key)
-        payload = build_payload(
-            messages=messages,
-            model=model,
-            stream=stream,
-            max_tokens=kw.get("max_tokens"),
-            temperature=kw.get("temperature"),
-            top_p=kw.get("top_p"),
-            stop=kw.get("stop"),
+        url, headers, payload = build_chat_request(
+            candidate, messages, model, stream, **kw
         )
-        url = "{}{}".format(BASE_URL, CHAT_PATH)
 
         try:
             async with self._session.post(
@@ -314,44 +219,14 @@ class ChutesClient:
                 ssl=False,
                 timeout=aiohttp.ClientTimeout(connect=10, total=600),
             ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    ks.mark_failure(resp.status)
-                    raise Exception(
-                        "chutes HTTP {}: {}".format(resp.status, body[:300])
-                    )
-
-                if stream:
-                    async for line in resp.content:
-                        if not line:
-                            continue
-                        text = line.decode("utf-8", errors="replace").strip()
-                        if not text or not text.startswith("data:"):
-                            continue
-                        data_str = text[5:].strip()
-                        if data_str == "[DONE]":
-                            break
-                        parsed = parse_sse_line(data_str)
-                        if parsed is not None:
-                            yield parsed
-                    ks.mark_success()
-                else:
-                    obj = await resp.json()
-                    ks.mark_success()
-                    choices = obj.get("choices") or []
-                    if choices:
-                        content = choices[0].get("message", {}).get("content", "")
-                        if content:
-                            yield content
-                    usage = obj.get("usage")
-                    if usage:
-                        yield {"usage": usage}
+                async for chunk in dispatch_chat_response(resp, stream, ks):
+                    yield chunk
+                ks.mark_success()
         except Exception as exc:
             if ks is not None:
                 ks.mark_failure(0)
             raise exc
 
     async def close(self) -> None:
-        """清理资源，session 由外部管理，此处不关闭。
-        """
+        """清理资源，session 由外部管理，此处不关闭。"""
         return
