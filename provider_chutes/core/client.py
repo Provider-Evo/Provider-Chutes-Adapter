@@ -1,7 +1,10 @@
-"""Chutes 客户端——每个 API Key 一个候选项"""
-
 from __future__ import annotations
 
+from pathlib import Path
+
+from src.foundation.config.reader import load_plugin_api_keys
+
+_PLUGIN_DIR = Path(__file__).resolve().parents[2]
 import asyncio
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -45,7 +48,7 @@ class ChutesClient:
         from ..accounts import API_KEYS
 
         self._key_states = [
-            _KeyState(k) for k in API_KEYS if isinstance(k, str) and k.strip()
+            _KeyState(k) for k in load_plugin_api_keys(_PLUGIN_DIR, API_KEYS)
         ]
         self._rebuild_candidates()
         logger.info(
