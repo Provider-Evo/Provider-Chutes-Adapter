@@ -6,14 +6,12 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import aiohttp
 
-from provider_sdk.model_ids import ModelIdRegistry
-
 from src.core.dispatch.cand import Candidate, make_id
 from src.foundation.config.reader import load_plugin_api_keys
 from src.foundation.logger import get_logger
 
 from .helpers.client_helpers import KeyState as _KeyState, build_chat_request, dispatch_chat_response
-from .consts import CAPS, MODELS
+from .consts import CAPS
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[2]
 
@@ -33,9 +31,7 @@ class ChutesClient:
     def __init__(self) -> None:
         """初始化客户端实例。"""
         self._session: Optional[aiohttp.ClientSession] = None
-        self._model_registry = ModelIdRegistry("chutes")
-        self._model_registry.load()
-        self._models: List[str] = self._model_registry.merge_fallback(MODELS)
+        self._models: List[str] = []
         self._candidates: List[Candidate] = []
         self._key_states: List[_KeyState] = []
 
@@ -72,9 +68,9 @@ class ChutesClient:
         Args:
             models: 新的模型列表。
         """
-        self._models = self._model_registry.register_many(models)
+        self._models = list(models)
         for cand in self._candidates:
-            cand.models = list(self._models)
+            cand.models = list(models)
 
     def _rebuild_candidates(self) -> None:
         """根据当前 Key 状态重建候选项列表。"""
@@ -165,7 +161,6 @@ class ChutesClient:
         Raises:
             Exception: 重试耗尽后抛出最后一次异常。
         """
-        model = self._model_registry.resolve_upstream(model)
         last_exc: Optional[Exception] = None
         for attempt in range(MAX_RETRIES + 1):
             if attempt > 0:
